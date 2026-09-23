@@ -2,13 +2,24 @@
 #import <UIKit/UIKit.h>
 #include <dlfcn.h>
 #include <objc/runtime.h>
+#import "../LiveContainer/utils.h"
 
 static NSString *loadTweakAtURL(NSURL *url) {
     NSString *tweakPath = url.path;
     NSString *tweak = tweakPath.lastPathComponent;
-    if (![tweakPath hasSuffix:@".dylib"]) {
+    if (![tweakPath hasSuffix:@".dylib"] && ![tweakPath hasSuffix:@".framework"]) {
         return nil;
     }
+    if ([tweakPath hasSuffix:@".framework"]) {
+        NSURL* infoPlistURL = [url URLByAppendingPathComponent:@"Info.plist"];
+        NSDictionary* infoDict = [NSDictionary dictionaryWithContentsOfURL:infoPlistURL];
+        NSString* binary = infoDict[@"CFBundleExecutable"];
+        if(!binary || ![binary isKindOfClass:NSString.class]) {
+            return [NSString stringWithFormat:@"Unable to load %@: Unable to read Info.Plist", tweak];
+        }
+        tweakPath = [[url URLByAppendingPathComponent:binary] path];
+    }
+    
     void *handle = dlopen(tweakPath.UTF8String, RTLD_LAZY | RTLD_GLOBAL);
     const char *error = dlerror();
     if (handle) {
@@ -20,6 +31,28 @@ static NSString *loadTweakAtURL(NSURL *url) {
     } else {
         NSLog(@"Error: dlopen(%@): Unknown error because dlerror() returns NULL", tweak);
         return [NSString stringWithFormat:@"dlopen(%@): unknown error, handle is NULL", tweakPath];
+    }
+}
+
+static void loadTweaksRecursively(NSURL *folderURL, NSMutableArray *errors) {
+    NSArray<NSURL *> *items = [NSFileManager.defaultManager contentsOfDirectoryAtURL:folderURL includingPropertiesForKeys:@[NSURLIsDirectoryKey] options:0 error:nil];
+    for (NSURL *fileURL in items) {
+        NSString *name = fileURL.lastPathComponent;
+        if ([name hasSuffix:@".disabled"]) {
+            NSLog(@"Skipping disabled tweak %@", name);
+            continue;
+        }
+        NSNumber *isDirectory = nil;
+        [fileURL getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:nil];
+        // a .framework is a directory but loads as a single tweak
+        if (isDirectory.boolValue && ![name hasSuffix:@".framework"]) {
+            loadTweaksRecursively(fileURL, errors);
+        } else {
+            NSString *error = loadTweakAtURL(fileURL);
+            if (error) {
+                [errors addObject:error];
+            }
+        }
     }
 }
 
@@ -48,11 +81,34 @@ static void TweakLoaderConstructor() {
     const char *tweakFolderC = getenv("LC_GLOBAL_TWEAKS_FOLDER");
     NSString *globalTweakFolder = @(tweakFolderC);
     unsetenv("LC_GLOBAL_TWEAKS_FOLDER");
-
+    
+    if([NSUserDefaults.guestAppInfo[@"dontInjectTweakLoader"] boolValue]) {
+        // don't load any tweak since tweakloader is loaded after all initializers
+        NSLog(@"Skip loading tweaks");
+        return;
+    }
+    
     NSMutableArray *errors = [NSMutableArray new];
+    
+    NSArray<NSURL *> *globalTweaks = [NSFileManager.defaultManager contentsOfDirectoryAtURL:[NSURL fileURLWithPath:globalTweakFolder]
+    includingPropertiesForKeys:@[] options:0 error:nil];
+    NSString *tweakFolderName = NSUserDefaults.guestAppInfo[@"LCTweakFolder"];
+    
+    if([globalTweaks count] <= 1 && tweakFolderName.length == 0) {
+        // nothing to load
+        return;
+    }
 
     // Load CydiaSubstrate
-    dlopen("@loader_path/CydiaSubstrate.framework/CydiaSubstrate", RTLD_LAZY | RTLD_GLOBAL);
+    const char *lcMainBundlePath;
+    if(NSUserDefaults.isLiveProcess) {
+        lcMainBundlePath = NSUserDefaults.lcMainBundle.bundlePath.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent.fileSystemRepresentation;
+    } else {
+        lcMainBundlePath = NSUserDefaults.lcMainBundle.bundlePath.fileSystemRepresentation;
+    }
+    char substratePath[PATH_MAX];
+    snprintf(substratePath, sizeof(substratePath), "%s/Frameworks/CydiaSubstrate.framework/CydiaSubstrate", lcMainBundlePath);
+    dlopen(substratePath, RTLD_LAZY | RTLD_GLOBAL);
     const char *substrateError = dlerror();
     if (substrateError) {
         [errors addObject:@(substrateError)];
@@ -60,9 +116,17 @@ static void TweakLoaderConstructor() {
 
     // Load global tweaks
     NSLog(@"Loading tweaks from the global folder");
-    NSArray<NSURL *> *globalTweaks = [NSFileManager.defaultManager contentsOfDirectoryAtURL:[NSURL fileURLWithPath:globalTweakFolder]
-    includingPropertiesForKeys:@[] options:0 error:nil];
+
     for (NSURL *fileURL in globalTweaks) {
+        NSString *name = fileURL.lastPathComponent;
+        if ([name isEqualToString:@"TweakLoader.dylib"]) {
+            // skip loading myself
+            continue;
+        }
+        if ([name hasSuffix:@".disabled"]) {
+            NSLog(@"Skipping disabled global tweak %@", name);
+            continue;
+        }
         NSString *error = loadTweakAtURL(fileURL);
         if (error) {
             [errors addObject:error];
@@ -70,21 +134,10 @@ static void TweakLoaderConstructor() {
     }
 
     // Load selected tweak folder, recursively
-    NSString *tweakFolderName = NSBundle.mainBundle.infoDictionary[@"LCTweakFolder"];
     if (tweakFolderName.length > 0) {
         NSLog(@"Loading tweaks from the selected folder");
         NSString *tweakFolder = [globalTweakFolder stringByAppendingPathComponent:tweakFolderName];
-        NSURL *tweakFolderURL = [NSURL fileURLWithPath:tweakFolder];
-        NSDirectoryEnumerator *directoryEnumerator = [NSFileManager.defaultManager enumeratorAtURL:tweakFolderURL includingPropertiesForKeys:@[] options:0 errorHandler:^BOOL(NSURL *url, NSError *error) {
-            NSLog(@"Error while enumerating tweak directory: %@", error);
-            return YES;
-        }];
-        for (NSURL *fileURL in directoryEnumerator) {
-            NSString *error = loadTweakAtURL(fileURL);
-            if (error) {
-                [errors addObject:error];
-            }
-        }
+        loadTweaksRecursively([NSURL fileURLWithPath:tweakFolder], errors);
     }
 
     if (errors.count > 0) {

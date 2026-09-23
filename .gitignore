@@ -1,6 +1,9 @@
 .theos/
 packages/
 .DS_Store
-LiveContainer.xcodeproj
-project.xcworkspace
+*.xcscmblueprint
+*.xccheckout
+*.xcarchive
 xcuserdata
+Resources/Frameworks/OpenSSL.framework
+apps_nightly.json
